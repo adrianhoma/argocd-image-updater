@@ -1294,6 +1294,44 @@ func Test_SetKustomizeImage(t *testing.T) {
 		assert.Equal(t, v1alpha1.KustomizeImage("jannfis/foobar:1.0.1"), app.Spec.Source.Kustomize.Images[0])
 	})
 
+	t.Run("Test alias entry with a different rename keeps its rename and gets only the tag", func(t *testing.T) {
+		app := &v1alpha1.Application{
+			ObjectMeta: v1.ObjectMeta{
+				Name:      "test-app",
+				Namespace: "testns",
+			},
+			Spec: v1alpha1.ApplicationSpec{
+				Source: &v1alpha1.ApplicationSource{
+					Kustomize: &v1alpha1.ApplicationSourceKustomize{
+						Images: v1alpha1.KustomizeImages{
+							"foobar=mirror.example.com/jannfis/foobar:1.0.0",
+						},
+					},
+				},
+			},
+			Status: v1alpha1.ApplicationStatus{
+				SourceType: v1alpha1.ApplicationSourceTypeKustomize,
+				Summary: v1alpha1.ApplicationSummary{
+					Images: []string{
+						"mirror.example.com/jannfis/foobar:1.0.0",
+					},
+				},
+			},
+		}
+		img := image.NewFromIdentifier("registry.example.com/jannfis/foobar:1.0.1")
+		wbc := &WriteBackConfig{
+			Target: "kustomization:.",
+		}
+		appImage := &Image{
+			KustomizeImageName: "foobar",
+		}
+		err := SetKustomizeImage(context.Background(), app, img, wbc, appImage)
+		require.NoError(t, err)
+		require.NotNil(t, app.Spec.Source.Kustomize)
+		assert.Len(t, app.Spec.Source.Kustomize.Images, 1)
+		assert.Equal(t, v1alpha1.KustomizeImage("foobar=mirror.example.com/jannfis/foobar:1.0.1"), app.Spec.Source.Kustomize.Images[0])
+	})
+
 	t.Run("Test set Kustomize image parameters on non-Kustomize app", func(t *testing.T) {
 		app := &v1alpha1.Application{
 			ObjectMeta: v1.ObjectMeta{

@@ -1047,29 +1047,42 @@ func SetKustomizeImage(ctx context.Context, app *argocdapi.Application, newImage
 		appSource.Kustomize = &argocdapi.ApplicationSourceKustomize{}
 	}
 
+	matched := false
+	override := image.NewFromIdentifier(ksImageParam)
 	for i, kImg := range appSource.Kustomize.Images {
 		curr := image.NewFromIdentifier(string(kImg))
-		override := image.NewFromIdentifier(ksImageParam)
 
-		// Entries must always agree on ImageName (registry+repo). When
-		// manifestTargets.kustomize.name is set and the entry already carries
-		// an alias, that alias must also match - otherwise two entries that
-		// share the same ImageName but target different kustomize image
-		// aliases would collapse onto the same slot, silently dropping one of
-		// them.
-		matched := curr.ImageName == override.ImageName
+		// Entries must agree on the repository and, when the entry names one
+		// explicitly, on the registry - an entry that spells the tracked
+		// image without a registry is the same image, while an explicit
+		// different registry is a deliberate rename handled below. When
+		// manifestTargets.kustomize.name is set and the entry already
+		// carries an alias, that alias must also match - otherwise two
+		// entries that share the same image name but target different
+		// kustomize image aliases would collapse onto the same slot,
+		// silently dropping one of them.
+		nameMatch := curr.ImageName == override.ImageName &&
+			(curr.RegistryURL == "" || curr.RegistryURL == override.RegistryURL)
 		if ksImageName != "" && curr.ImageAlias != "" {
-			matched = matched && curr.ImageAlias == ksImageName
+			nameMatch = nameMatch && curr.ImageAlias == ksImageName
 		}
 
-		if matched {
-			curr.ImageAlias = override.ImageAlias
+		switch {
+		case nameMatch:
 			appSource.Kustomize.Images[i] = argocdapi.KustomizeImage(override.String())
+			matched = true
+		case ksImageName != "" && curr.ImageAlias == ksImageName:
+			// The entry renames the aliased image to something other than
+			// the tracked image (e.g. a pull-through cache mirror). Keep the
+			// rename and update only the tag.
+			appSource.Kustomize.Images[i] = argocdapi.KustomizeImage(curr.WithTag(newImage.ImageTag).String())
+			matched = true
 		}
-
 	}
 
-	appSource.Kustomize.MergeImage(argocdapi.KustomizeImage(ksImageParam))
+	if !matched {
+		appSource.Kustomize.MergeImage(argocdapi.KustomizeImage(ksImageParam))
+	}
 
 	return nil
 }
