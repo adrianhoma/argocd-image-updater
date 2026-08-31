@@ -424,7 +424,7 @@ func writeKustomization(ctx context.Context, applicationImages *ApplicationImage
 		images = kustomize.Images
 	}
 
-	filterFunc, err := imagesFilter(images)
+	filterFunc, err := imagesFilter(ctx, images)
 	if err != nil {
 		return err, false
 	}
@@ -558,41 +558,220 @@ func updateKustomizeFile(ctx context.Context, filter kyaml.Filter, path string) 
 	return nil, false
 }
 
-func imagesFilter(images v1alpha1.KustomizeImages) (kyaml.Filter, error) {
-	var overrides []kyaml.Filter
+func imagesFilter(ctx context.Context, images v1alpha1.KustomizeImages) (kyaml.Filter, error) {
+	var overrides []types.Image
 	for _, img := range images {
-		override, err := imageFilter(parseImageOverride(img))
+		imgSet := parseImageOverride(img)
+		if imgSet.Name == "" {
+			return nil, fmt.Errorf("invalid kustomize image override %q: no image name", string(img))
+		}
+		overrides = append(overrides, imgSet)
+	}
+
+	return kyaml.FilterFunc(func(object *kyaml.RNode) (*kyaml.RNode, error) {
+		if images, err := object.Pipe(kyaml.Lookup("images")); err != nil {
+			return nil, err
+		} else if images != nil {
+			normalizeNullSequence(images)
+		}
+		seq, err := object.Pipe(kyaml.LookupCreate(kyaml.SequenceNode, "images"))
 		if err != nil {
 			return nil, err
 		}
-		overrides = append(overrides, override)
-	}
-
-	return kyaml.FilterFunc(func(object *kyaml.RNode) (*kyaml.RNode, error) {
-		err := object.PipeE(append([]kyaml.Filter{kyaml.LookupCreate(
-			kyaml.SequenceNode, "images",
-		)}, overrides...)...)
-		return object, err
+		// An override may only merge into entries that were already in the
+		// file, never into entries appended by an earlier override of the
+		// same batch - otherwise the result would depend on override order.
+		original, err := mappingElements(seq)
+		if err != nil {
+			return nil, err
+		}
+		originalSet := make(map[*kyaml.Node]bool, len(original))
+		for _, elem := range original {
+			originalSet[elem.YNode()] = true
+		}
+		for _, imgSet := range overrides {
+			if err := applyImageOverride(ctx, seq, imgSet, originalSet); err != nil {
+				return nil, err
+			}
+		}
+		return object, nil
 	}), nil
 }
 
-func imageFilter(imgSet types.Image) (kyaml.Filter, error) {
-	data, err := kyaml.Marshal(imgSet)
+// applyImageOverride merges one image override into the images sequence. An
+// entry is addressed by its name (kustomize's own matching), or - for an
+// override without an alias - by a newName that produces the tracked image,
+// so a rename the file already carries is updated in place instead of
+// appended as a duplicate. Without a match, the override is appended as a
+// new entry.
+func applyImageOverride(ctx context.Context, seq *kyaml.RNode, imgSet types.Image, original map[*kyaml.Node]bool) error {
+	logCtx := log.LoggerFromContext(ctx)
+	elements, err := mappingElements(seq)
+	if err != nil {
+		return err
+	}
+
+	var matches []*kyaml.RNode
+	for _, elem := range elements {
+		if elementField(elem, "name") == imgSet.Name {
+			matches = append(matches, elem)
+		}
+	}
+	if len(matches) == 0 && imgSet.NewName == "" {
+		// An override with an alias always addresses the entry named after
+		// the alias; falling through to a final-image match instead would
+		// retarget an entry belonging to a different source image.
+		for _, elem := range elements {
+			if !original[elem.YNode()] {
+				continue
+			}
+			if newName := elementField(elem, "newName"); newName != "" && sameImageRef(newName, imgSet.Name) {
+				logCtx.Debugf("updating kustomize entry %q in place: its newName %q produces image %q", elementField(elem, "name"), newName, imgSet.Name)
+				matches = append(matches, elem)
+			}
+		}
+	}
+
+	if len(matches) == 0 {
+		return appendImageElement(seq, imgSet)
+	}
+	for _, match := range matches {
+		if err := mergeImageOverride(ctx, match, imgSet); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// mergeImageOverride updates a matched images entry in place. Only newTag and
+// digest are written - an existing newName is never overwritten, since it may
+// deliberately differ from the tracked image (e.g. a pull-through cache
+// mirror). newName is only added when the entry has no newName field at all
+// and it would not be redundant with name.
+func mergeImageOverride(ctx context.Context, match *kyaml.RNode, imgSet types.Image) error {
+	if imgSet.NewName != "" {
+		if f := match.Field("newName"); f == nil {
+			if elementField(match, "name") != imgSet.NewName {
+				if err := setElementField(match, "newName", imgSet.NewName); err != nil {
+					return err
+				}
+			}
+		} else if existing := kyaml.GetValue(f.Value); !sameImageRef(existing, imgSet.NewName) {
+			log.LoggerFromContext(ctx).Warnf("not overwriting newName %q with %q for kustomize image %q", existing, imgSet.NewName, imgSet.Name)
+		}
+	}
+	// the override holds the complete desired tag/digest state, so a field it
+	// lacks is stale and must be removed
+	for _, fv := range []struct{ name, value string }{{"newTag", imgSet.NewTag}, {"digest", imgSet.Digest}} {
+		if fv.value == "" {
+			if err := match.PipeE(kyaml.Clear(fv.name)); err != nil {
+				return err
+			}
+			continue
+		}
+		if err := setElementField(match, fv.name, fv.value); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// appendImageElement appends the override as a new images entry, built field
+// by field so each scalar carries the style its own value requires.
+func appendImageElement(seq *kyaml.RNode, imgSet types.Image) error {
+	elem := kyaml.NewMapRNode(nil)
+	for _, fv := range []struct{ name, value string }{
+		{"name", imgSet.Name},
+		{"newName", imgSet.NewName},
+		{"newTag", imgSet.NewTag},
+		{"digest", imgSet.Digest},
+	} {
+		if fv.value == "" {
+			continue
+		}
+		if err := setElementField(elem, fv.name, fv.value); err != nil {
+			return err
+		}
+	}
+	seq.YNode().Content = append(seq.YNode().Content, elem.YNode())
+	return nil
+}
+
+// setElementField writes a scalar field, replacing the whole value node so
+// the style is derived from the new value, not inherited from the old one -
+// kyaml's FieldSetter keeps an existing plain style in place, which would
+// emit YAML 1.1 booleans like "on" unquoted and change their type on the
+// next parse.
+func setElementField(elem *kyaml.RNode, field, value string) error {
+	node := kyaml.NewStringRNode(value)
+	if kyaml.IsYaml1_1NonString(node.YNode()) {
+		node.YNode().Style = kyaml.DoubleQuotedStyle
+	}
+	if f := elem.Field(field); f != nil {
+		f.Value.SetYNode(node.YNode())
+		return nil
+	}
+	return elem.PipeE(kyaml.FieldSetter{Name: field, Value: node, OverrideStyle: true})
+}
+
+// mappingElements returns the sequence's mapping elements, skipping elements
+// of any other kind - the same elements kyaml's ElementMatcher considers.
+func mappingElements(seq *kyaml.RNode) ([]*kyaml.RNode, error) {
+	elements, err := seq.Elements()
 	if err != nil {
 		return nil, err
 	}
-	update, err := kyaml.Parse(string(data))
-	if err != nil {
-		return nil, err
+	var mappings []*kyaml.RNode
+	for _, elem := range elements {
+		if elem.YNode().Kind == kyaml.MappingNode {
+			mappings = append(mappings, elem)
+		}
 	}
-	setter := kyaml.ElementSetter{
-		Element: update.YNode(),
-		Keys:    []string{"name"},
-		Values:  []string{imgSet.Name},
+	return mappings, nil
+}
+
+// normalizeNullSequence converts a null-valued node (a bare "images:" key)
+// into an empty sequence, so appended entries land in the document - content
+// appended under a null scalar is dropped at serialization time.
+func normalizeNullSequence(node *kyaml.RNode) {
+	y := node.YNode()
+	if y.Kind == kyaml.ScalarNode && (y.Tag == kyaml.NodeTagNull || y.Tag == kyaml.NodeTagEmpty) && len(y.Content) == 0 {
+		y.Kind = kyaml.SequenceNode
+		y.Tag = kyaml.NodeTagSeq
+		y.Value = ""
+		y.Style = 0
 	}
-	return kyaml.FilterFunc(func(object *kyaml.RNode) (*kyaml.RNode, error) {
-		return object, object.PipeE(setter)
-	}), nil
+}
+
+// sameImageRef reports whether two image references name the same image,
+// tolerating the equivalent Docker Hub spellings (a docker.io/ or
+// index.docker.io/ prefix, and the library/ namespace of official images).
+func sameImageRef(a, b string) bool {
+	return normalizeImageRef(a) == normalizeImageRef(b)
+}
+
+func normalizeImageRef(ref string) string {
+	for _, prefix := range []string{"docker.io/", "index.docker.io/"} {
+		if strings.HasPrefix(ref, prefix) {
+			ref = strings.TrimPrefix(ref, prefix)
+			break
+		}
+	}
+	// only Docker Hub references (no registry host containing a dot or port)
+	// carry an implicit library/ namespace
+	if host, _, found := strings.Cut(ref, "/"); found && !strings.Contains(host, ".") && !strings.Contains(host, ":") {
+		ref = strings.TrimPrefix(ref, "library/")
+	}
+	return ref
+}
+
+// elementField returns the scalar value of a mapping field, or "" when absent.
+func elementField(node *kyaml.RNode, field string) string {
+	f := node.Field(field)
+	if f == nil {
+		return ""
+	}
+	return kyaml.GetValue(f.Value)
 }
 
 const blankLineMarker = "# __preserve_blank_line__"

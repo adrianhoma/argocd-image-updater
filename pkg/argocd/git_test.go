@@ -329,8 +329,8 @@ images:
 			"foo",
 			"foo=bar", // merges with above
 			"baz@sha12345",
-			"bar:123",
-			"foo=bar:123", // merges and overwrites the first two
+			"bar:123",     // appends: no pre-existing entry produces "bar"
+			"foo=bar:123", // merges into the foo entry by alias
 		}, expected: `
 images:
 - name: foo
@@ -341,9 +341,32 @@ images:
 - name: bar
   newTag: "123"
 `},
+		// the same overrides produce the same set of entries in any order
+		{name: "order independence", images: v1alpha1.KustomizeImages{
+			"foo=bar:456",
+			"bar:123",
+		}, expected: `
+images:
+- name: foo
+  newName: bar
+  newTag: "456"
+- name: bar
+  newTag: "123"
+`},
+		{name: "order independence reversed", images: v1alpha1.KustomizeImages{
+			"bar:123",
+			"foo=bar:456",
+		}, expected: `
+images:
+- name: bar
+  newTag: "123"
+- name: foo
+  newName: bar
+  newTag: "456"
+`},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
-			filter, err := imagesFilter(tt.images)
+			filter, err := imagesFilter(context.Background(), tt.images)
 			assert.NoError(t, err)
 
 			node := kyaml.NewRNode(&kyaml.Node{Kind: kyaml.DocumentNode, Content: []*kyaml.Node{
@@ -354,6 +377,29 @@ images:
 			assert.YAMLEq(t, tt.expected, node.MustString())
 		})
 	}
+
+	t.Run("rejects an override without an image name", func(t *testing.T) {
+		_, err := imagesFilter(context.Background(), v1alpha1.KustomizeImages{""})
+		assert.Error(t, err)
+	})
+
+	t.Run("filter application does not alias nodes across documents", func(t *testing.T) {
+		filter, err := imagesFilter(context.Background(), v1alpha1.KustomizeImages{"foo:v1"})
+		assert.NoError(t, err)
+
+		first := kyaml.MustParse("resources: []\n")
+		second := kyaml.MustParse("resources: []\n")
+		_, err = filter.Filter(first)
+		assert.NoError(t, err)
+		_, err = filter.Filter(second)
+		assert.NoError(t, err)
+
+		// mutating the entry appended to one document must not leak into the other
+		assert.NoError(t, second.PipeE(kyaml.Lookup("images", "[name=foo]"), kyaml.SetField("newTag", kyaml.NewStringRNode("v2"))))
+		firstTag, err := first.Pipe(kyaml.Lookup("images", "[name=foo]", "newTag"))
+		assert.NoError(t, err)
+		assert.Equal(t, "v1", kyaml.GetValue(firstTag))
+	})
 }
 
 func Test_updateKustomizeFile(t *testing.T) {
@@ -373,9 +419,17 @@ func Test_updateKustomizeFile(t *testing.T) {
 		return f.Name()
 	}
 
-	filter, err := imagesFilter(v1alpha1.KustomizeImages{"foo@sha23456"})
+	filter, err := imagesFilter(context.Background(), v1alpha1.KustomizeImages{"foo@sha23456"})
 	if err != nil {
 		t.Fatal(err)
+	}
+
+	mustFilter := func(images v1alpha1.KustomizeImages) kyaml.Filter {
+		f, err := imagesFilter(context.Background(), images)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return f
 	}
 
 	tests := []struct {
@@ -559,6 +613,177 @@ images:
   digest: sha23456
 `,
 			filter: filter,
+		},
+		{
+			// Reproduces issue #312: an update addressed by alias must not overwrite an
+			// existing newName that differs from the tracked image (e.g. a
+			// pull-through cache mirror), and must only bump the tag.
+			name: "preserves newName on alias update",
+			content: `images:
+- name: foo
+  newName: mirror.example.com/registry/foo
+  newTag: v1.0.0
+`,
+			wantContent: `images:
+- name: foo
+  newName: mirror.example.com/registry/foo
+  newTag: v1.1.0
+`,
+			filter: mustFilter(v1alpha1.KustomizeImages{"foo=registry.example.com/foo:v1.1.0"}),
+		},
+		{
+			// Reproduces issue #312: an override without an alias must find the entry whose
+			// newName produces the tracked image instead of appending a
+			// duplicate entry.
+			name: "matches entry by newName instead of appending duplicate",
+			content: `images:
+- name: foo
+  newName: registry.example.com/foo
+  newTag: v1.0.0
+`,
+			wantContent: `images:
+- name: foo
+  newName: registry.example.com/foo
+  newTag: v1.1.0
+`,
+			filter: mustFilter(v1alpha1.KustomizeImages{"registry.example.com/foo:v1.1.0"}),
+		},
+		{
+			// A name match with an existing newName keeps the rename even
+			// when the override carries no alias.
+			name: "preserves newName on plain name match",
+			content: `images:
+- name: registry.example.com/foo
+  newName: mirror.example.com/registry/foo
+  newTag: v1.0.0
+`,
+			wantContent: `images:
+- name: registry.example.com/foo
+  newName: mirror.example.com/registry/foo
+  newTag: v1.1.0
+`,
+			filter: mustFilter(v1alpha1.KustomizeImages{"registry.example.com/foo:v1.1.0"}),
+		},
+		{
+			name: "appends entry when nothing matches",
+			content: `images:
+- name: foo
+  newTag: v1.0.0
+`,
+			wantContent: `images:
+- name: foo
+  newTag: v1.0.0
+- name: bar
+  newTag: v2.0.0
+`,
+			filter: mustFilter(v1alpha1.KustomizeImages{"bar:v2.0.0"}),
+		},
+		{
+			name: "switching from tag to digest clears newTag",
+			content: `images:
+- name: foo
+  newName: registry.example.com/foo
+  newTag: v1.0.0
+`,
+			wantContent: `images:
+- name: foo
+  newName: registry.example.com/foo
+  digest: sha23456
+`,
+			filter: mustFilter(v1alpha1.KustomizeImages{"foo=registry.example.com/foo@sha23456"}),
+		},
+		{
+			// An aliased override addresses only the entry named after its
+			// alias; it must not hijack an entry for a different source
+			// image whose name merely equals the override's final image.
+			name: "aliased override does not hijack a final-image entry",
+			content: `images:
+- name: bar
+  newTag: v1
+`,
+			wantContent: `images:
+- name: bar
+  newTag: v1
+- name: foo
+  newName: bar
+  newTag: v2
+`,
+			filter: mustFilter(v1alpha1.KustomizeImages{"foo=bar:v2"}),
+		},
+		{
+			name: "updates every entry sharing the same name",
+			content: `images:
+- name: foo
+  newTag: a
+- name: foo
+  newTag: a
+`,
+			wantContent: `images:
+- name: foo
+  newTag: v2
+- name: foo
+  newTag: v2
+`,
+			filter: mustFilter(v1alpha1.KustomizeImages{"foo:v2"}),
+		},
+		{
+			// YAML 1.1 booleans must be quoted when replacing a plain-style
+			// value, or the next parse changes their type and kustomize
+			// fails to unmarshal the file.
+			name: "quotes a YAML 1.1 boolean tag",
+			content: `images:
+- name: foo
+  newTag: v1.0.0
+`,
+			wantContent: `images:
+- name: foo
+  newTag: "on"
+`,
+			filter: mustFilter(v1alpha1.KustomizeImages{"foo:on"}),
+		},
+		{
+			name: "populates a null-valued images key",
+			content: `kind: Kustomization
+images:
+`,
+			wantContent: `kind: Kustomization
+images:
+- name: foo
+  digest: sha23456
+`,
+			filter: filter,
+		},
+		{
+			// A newName explicitly set to null is a present field and must
+			// not be overwritten, same as any other existing newName.
+			name: "preserves an explicitly null newName",
+			content: `images:
+- name: foo
+  newName: null
+  newTag: v1
+`,
+			wantContent: `images:
+- name: foo
+  newName: null
+  newTag: "2"
+`,
+			filter: mustFilter(v1alpha1.KustomizeImages{"foo=bar:2"}),
+		},
+		{
+			// Docker Hub images spell the same reference with or without the
+			// docker.io/ prefix; both must match the entry's newName.
+			name: "matches newName across docker.io spellings",
+			content: `images:
+- name: app
+  newName: docker.io/myorg/app
+  newTag: v1
+`,
+			wantContent: `images:
+- name: app
+  newName: docker.io/myorg/app
+  newTag: v3
+`,
+			filter: mustFilter(v1alpha1.KustomizeImages{"myorg/app:v3"}),
 		},
 		{
 			name: "preserves marker after a leading YAML directive",

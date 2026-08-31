@@ -6677,7 +6677,8 @@ images:
 replacements: []
 `, string(kust))
 
-		// test the merge case too
+		// test the merge case too: tag updates merge into existing entries,
+		// and an existing newName is preserved rather than overwritten
 		app.Spec.Source.Kustomize.Images = v1alpha1.KustomizeImages{"foo:123", "bar=qux"}
 		applicationImages = &ApplicationImages{
 			Application:     *app,
@@ -6693,9 +6694,10 @@ kind: Kustomization
 apiVersion: kustomize.config.k8s.io/v1beta1
 images:
   - name: foo
+    newName: bar
     newTag: "123"
   - name: bar
-    newName: qux
+    newName: baz
 
 replacements: []
 `, string(kust))
