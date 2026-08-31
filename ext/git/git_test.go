@@ -529,7 +529,7 @@ func TestNewFactory(t *testing.T) {
 	require.NoError(t, runCmd(workDir, "git", "tag", "v1.0.0"))
 	require.NoError(t, runCmd(workDir, "git", "commit", "--allow-empty", "-m", "second commit"))
 
-	require.NoError(t, runCmd(bareDir, "git", "init", "--bare"))
+	require.NoError(t, runCmd(bareDir, "git", "init", "--bare", "-b", "master"))
 	require.NoError(t, runCmd(workDir, "git", "remote", "add", "origin", bareDir))
 	require.NoError(t, runCmd(workDir, "git", "push", "origin", "master", "--tags"))
 
@@ -785,7 +785,7 @@ func setupLocalRemoteRepo(t *testing.T) (repoURL, commitSHA string) {
 	require.NoError(t, runCmd(workDir, "git", "checkout", "master"))
 	require.NoError(t, runCmd(workDir, "git", "tag", "v0.8.0"))
 
-	require.NoError(t, runCmd(bareDir, "git", "init", "--bare"))
+	require.NoError(t, runCmd(bareDir, "git", "init", "--bare", "-b", "master"))
 	require.NoError(t, runCmd(workDir, "git", "remote", "add", "origin", bareDir))
 	require.NoError(t, runCmd(workDir, "git", "push", "origin", "master", "release-0.8"))
 	require.NoError(t, runCmd(workDir, "git", "push", "origin", "--tags"))
