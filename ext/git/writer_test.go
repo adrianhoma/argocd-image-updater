@@ -273,7 +273,7 @@ func TestPush(t *testing.T) {
 		require.NoError(t, runCmd(workDir, "git", "config", "user.email", "test@example.com"))
 		require.NoError(t, runCmd(workDir, "git", "config", "user.name", "Test User"))
 		require.NoError(t, runCmd(workDir, "git", "commit", "--allow-empty", "-m", "initial"))
-		require.NoError(t, runCmd(bareDir, "git", "init", "--bare"))
+		require.NoError(t, runCmd(bareDir, "git", "init", "--bare", "-b", "master"))
 		require.NoError(t, runCmd(workDir, "git", "remote", "add", "origin", bareDir))
 
 		var err error
@@ -337,7 +337,7 @@ func TestSymRefToBranch(t *testing.T) {
 	require.NoError(t, runCmd(workDir, "git", "config", "user.email", "test@example.com"))
 	require.NoError(t, runCmd(workDir, "git", "config", "user.name", "Test User"))
 	require.NoError(t, runCmd(workDir, "git", "commit", "--allow-empty", "-m", "initial"))
-	require.NoError(t, runCmd(bareDir, "git", "init", "--bare"))
+	require.NoError(t, runCmd(bareDir, "git", "init", "--bare", "-b", "main"))
 	require.NoError(t, runCmd(workDir, "git", "remote", "add", "origin", bareDir))
 	require.NoError(t, runCmd(workDir, "git", "push", "origin", "main"))
 	require.NoError(t, runCmd(bareDir, "git", "symbolic-ref", "HEAD", "refs/heads/main"))
